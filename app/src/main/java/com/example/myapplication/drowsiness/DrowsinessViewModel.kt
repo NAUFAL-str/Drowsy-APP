@@ -1,4 +1,4 @@
-// drowsiness/DrowsinessViewModel.kt - MediaPipe FaceLandmarker Implementation
+// drowsiness/DrowsinessViewModel.kt - MediaPipe FaceLandmarker Implementation with Immediate Predictions
 package com.example.myapplication.drowsiness
 
 import android.content.Context
@@ -65,9 +65,10 @@ class DrowsinessViewModel : ViewModel() {
         private const val RIGHT_MOUTH_IDX = 308
     }
 
-    // Feature sequence buffer
+    // Feature sequence buffer - now with immediate prediction capability
     private val featureSequence = ArrayDeque<FloatArray>()
-    private val seqLen = 60
+    private val maxSeqLen = 24  // Maximum context frames
+    private val minSeqLen = 24   // Minimum frames before starting predictions
 
     // Statistics for logging
     private var frameCount = 0L // Use Long for potentially large counts
@@ -86,12 +87,12 @@ class DrowsinessViewModel : ViewModel() {
                     Log.d(TAG, "🤖 Attempting to load TensorFlow Lite model...")
                     initializeTensorFlowLite(context)
                     _drowsinessState.value = _drowsinessState.value.copy(
-                        status = "Ready - TF Model Loaded"
+                        status = "Ready - Model Loaded"
                     )
                     Log.i(TAG, "✅ TensorFlow Lite model loaded successfully!")
                 } catch (e: Exception) {
                     _drowsinessState.value = _drowsinessState.value.copy(
-                        status = "Ready - MediaPipe Only (TF Model Load Failed)"
+                        status = "Ready - MediaPipe Only (Model Load Failed)"
                     )
                     Log.w(TAG, "⚠️ TensorFlow model not found or failed to load: ${e.message}", e)
                     Log.w(TAG, "👉 Expected TFLite model location: app/src/main/assets/models/drowsiness_sequence_gru.tflite")
@@ -368,13 +369,12 @@ class DrowsinessViewModel : ViewModel() {
                     val mar = computeMAR(landmarks, imageWidth, imageHeight)
                     Log.d(TAG, String.format(Locale.US,"🔢 Calculated Features - EAR: %.3f, MAR: %.3f", ear, mar))
 
-
+                    // Add new features to sequence
                     featureSequence.offer(floatArrayOf(ear, mar))
-                    if (featureSequence.size > seqLen) {
-                        featureSequence.poll() // Remove oldest if buffer is full
+                    if (featureSequence.size > maxSeqLen) {
+                        featureSequence.poll() // Remove oldest if buffer exceeds maximum
                     }
-                    Log.v(TAG, "Feature sequence size: ${featureSequence.size}/$seqLen")
-
+                    Log.v(TAG, "Feature sequence size: ${featureSequence.size}/$maxSeqLen")
 
                     _drowsinessState.value = _drowsinessState.value.copy(
                         featureCount = featureSequence.size,
@@ -383,20 +383,23 @@ class DrowsinessViewModel : ViewModel() {
                         // mar = mar
                     )
 
-                    if (featureSequence.size == seqLen) {
+                    // Make prediction if we have minimum required frames
+                    if (featureSequence.size >= minSeqLen) {
                         predictionCount++
-                        Log.d(TAG, "🚀 Feature sequence full. Making prediction #$predictionCount")
+                        Log.d(TAG, "🚀 Making prediction #$predictionCount with ${featureSequence.size} frames")
                         if (tfliteInterpreter != null) {
                             makeTensorFlowPrediction()
                         } else {
                             Log.d(TAG, "🧠 No TFLite model. Using MediaPipe rule-based prediction.")
                             makeMediaPipePrediction(ear)
                         }
+                    } else {
+                        Log.d(TAG, "⏳ Need ${minSeqLen - featureSequence.size} more frames before prediction (current: ${featureSequence.size})")
                     }
 
                     // Periodic detailed statistics
                     if (frameCount % 100 == 0L) { // Log every 100 frames
-                        Log.i(TAG, "📊 Stats Update - Frames Processed: $frameCount, Faces Detected: $facesDetectedCount, Predictions Made: $predictionCount, Feature Seq: ${featureSequence.size}/$seqLen")
+                        Log.i(TAG, "📊 Stats Update - Frames Processed: $frameCount, Faces Detected: $facesDetectedCount, Predictions Made: $predictionCount, Feature Seq: ${featureSequence.size}/$maxSeqLen")
                     }
                 } else {
                     // Log less frequently if no face is detected to avoid spamming logs
@@ -486,26 +489,44 @@ class DrowsinessViewModel : ViewModel() {
     }
 
     private fun makeTensorFlowPrediction() {
-        Log.d(TAG, "🤖 Making TensorFlow prediction with sequence of ${featureSequence.size} features.")
+        val currentSeqSize = featureSequence.size
+        Log.d(TAG, "🤖 Making TensorFlow prediction with sequence of $currentSeqSize features (max: $maxSeqLen).")
         val interpreter: Interpreter = tfliteInterpreter ?: run {
             Log.e(TAG, "💥 TFLite Interpreter is null. Cannot make prediction.")
             return
         }
 
         try {
-            // Prepare input: (1, seqLen, num_features) which is (1, 60, 2)
-            val inputArray = Array(1) { Array(seqLen) { FloatArray(2) } }
+            // Prepare input: (1, maxSeqLen, num_features) which is (1, 60, 2)
+            // Pad with zeros if we have fewer than maxSeqLen frames
+            val inputArray = Array(1) { Array(maxSeqLen) { FloatArray(2) } }
+
+            // Calculate padding needed
+            val paddingNeeded = maxSeqLen - currentSeqSize
+
+            // Fill with zeros first (padding at the beginning)
+            for (i in 0 until paddingNeeded) {
+                inputArray[0][i][0] = 0f // EAR
+                inputArray[0][i][1] = 0f // MAR
+            }
+
+            // Fill with actual feature data
             featureSequence.forEachIndexed { index, features ->
-                if (features.size == 2) {
-                    inputArray[0][index][0] = features[0] // EAR
-                    inputArray[0][index][1] = features[1] // MAR
+                val targetIndex = paddingNeeded + index
+                if (features.size == 2 && targetIndex < maxSeqLen) {
+                    inputArray[0][targetIndex][0] = features[0] // EAR
+                    inputArray[0][targetIndex][1] = features[1] // MAR
                 } else {
-                    Log.w(TAG, "⚠️ Feature at index $index has unexpected size: ${features.size}. Expected 2.")
+                    Log.w(TAG, "⚠️ Feature at index $index has unexpected size: ${features.size} or target index out of bounds: $targetIndex")
                     // Handle error or fill with default, e.g., 0s
-                    inputArray[0][index][0] = 0f
-                    inputArray[0][index][1] = 0f
+                    if (targetIndex < maxSeqLen) {
+                        inputArray[0][targetIndex][0] = 0f
+                        inputArray[0][targetIndex][1] = 0f
+                    }
                 }
             }
+
+            Log.d(TAG, "📝 Input prepared: ${currentSeqSize} real frames + ${paddingNeeded} padded frames = ${maxSeqLen} total")
 
             // Prepare output: (1, 1) for drowsiness probability
             val outputArray = Array(1) { FloatArray(1) }
@@ -515,12 +536,11 @@ class DrowsinessViewModel : ViewModel() {
             val inferenceTime = System.currentTimeMillis() - startTime
             Log.d(TAG, "⏱️ TensorFlow inference took ${inferenceTime}ms.")
 
-
             val drowsinessProb: Float = outputArray[0][0]
             val isDrowsy = drowsinessProb > 0.7f // Threshold for drowsiness
             val status: String = if (isDrowsy) "Drowsy" else "Alert"
 
-            Log.i(TAG, "🎯 TensorFlow Prediction: $status (Raw Probability: ${String.format(Locale.US, "%.4f", drowsinessProb)})")
+            Log.i(TAG, "🎯 TensorFlow Prediction: $status (Raw Probability: ${String.format(Locale.US, "%.4f", drowsinessProb)}, Frames: $currentSeqSize/$maxSeqLen)")
 
             viewModelScope.launch(Dispatchers.Main) { // Update UI on Main thread
                 _drowsinessState.value = _drowsinessState.value.copy(
@@ -593,13 +613,3 @@ class DrowsinessViewModel : ViewModel() {
         Log.i(TAG, "✅ ViewModel cleared and resources released.")
     }
 }
-
-// Assuming DrowsinessState looks something like this (add if not present)
-// data class DrowsinessState(
-// val status: String = "Initializing",
-// val probability: Float = 0.0f,
-// val ear: Float = 0.0f,
-// val mar: Float = 0.0f,
-// val featureCount: Int = 0,
-// val isDrowsy: Boolean = false
-// )
