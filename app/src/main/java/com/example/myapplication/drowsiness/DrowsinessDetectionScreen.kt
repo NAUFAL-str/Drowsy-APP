@@ -2,6 +2,10 @@
 package com.example.myapplication.drowsiness
 
 import android.Manifest
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.MediaPlayer
 import android.view.ViewGroup
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.layout.*
@@ -17,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.myapplication.R
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
@@ -34,10 +39,40 @@ fun DrowsinessDetectionScreen(
     val drowsinessState by viewModel.drowsinessState.collectAsState()
     val isProcessing by viewModel.isProcessing.collectAsState()
 
+    // Alarm state
+    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var isAlarmPlaying by remember { mutableStateOf(false) }
+
     // Initialize detection when permission is granted
     LaunchedEffect(cameraPermissionState.status.isGranted) {
         if (cameraPermissionState.status.isGranted) {
             viewModel.initializeDetection(context)
+        }
+    }
+
+    // Handle alarm based on drowsiness state
+    LaunchedEffect(drowsinessState.status) {
+        when (drowsinessState.status) {
+            "Drowsy" -> {
+                if (!isAlarmPlaying) {
+                    mediaPlayer = startAlarm(context)
+                    isAlarmPlaying = true
+                }
+            }
+            "Alert" -> {
+                if (isAlarmPlaying) {
+                    stopAlarm(mediaPlayer)
+                    mediaPlayer = null
+                    isAlarmPlaying = false
+                }
+            }
+        }
+    }
+
+    // Clean up alarm when composable is disposed
+    DisposableEffect(Unit) {
+        onDispose {
+            stopAlarm(mediaPlayer)
         }
     }
 
@@ -65,6 +100,7 @@ fun DrowsinessDetectionScreen(
                 StatusOverlay(
                     drowsinessState = drowsinessState,
                     isProcessing = isProcessing,
+                    isAlarmPlaying = isAlarmPlaying,
                     modifier = Modifier.align(Alignment.TopCenter)
                 )
             }
@@ -90,10 +126,59 @@ fun DrowsinessDetectionScreen(
     }
 }
 
+// Alarm functions
+private fun startAlarm(context: Context): MediaPlayer? {
+    return try {
+        // 1) Force ALARM stream to maximum volume
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val maxAlarmVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+        audioManager.setStreamVolume(
+            AudioManager.STREAM_ALARM,
+            maxAlarmVol,
+            AudioManager.FLAG_PLAY_SOUND or AudioManager.FLAG_SHOW_UI
+        )
+
+        // 2) Load the loud alarm sound from res/raw/loud_alarm.mp3
+        val mediaPlayer = MediaPlayer.create(context, R.raw.loud_alarm)
+
+        // 3) Configure as ALARM usage
+        mediaPlayer.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+        )
+        mediaPlayer.isLooping = true
+
+        // 4) Ensure playback volume is at max on the ALARM stream
+        mediaPlayer.setVolume(1.0f, 1.0f)
+
+        mediaPlayer.start()
+        mediaPlayer
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
+private fun stopAlarm(mediaPlayer: MediaPlayer?) {
+    try {
+        mediaPlayer?.apply {
+            if (isPlaying) {
+                stop()
+            }
+            release()
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+}
+
 @Composable
 private fun StatusOverlay(
     drowsinessState: DrowsinessState,
     isProcessing: Boolean,
+    isAlarmPlaying: Boolean,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -117,7 +202,7 @@ private fun StatusOverlay(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = drowsinessState.status,
+                    text = if (isAlarmPlaying) "⚠️ ${drowsinessState.status} ⚠️" else drowsinessState.status,
                     fontSize = 24.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.White
@@ -128,34 +213,16 @@ private fun StatusOverlay(
                     fontSize = 16.sp,
                     color = Color.White.copy(alpha = 0.9f)
                 )
-            }
-        }
 
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Info card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(8.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = Color.Black.copy(alpha = 0.7f)
-            )
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = "Features: ${drowsinessState.featureCount}/60",
-                    fontSize = 14.sp,
-                    color = Color.White
-                )
-
-                Text(
-                    text = if (isProcessing) "Processing..." else "Ready",
-                    fontSize = 12.sp,
-                    color = Color.White.copy(alpha = 0.8f)
-                )
+                if (isAlarmPlaying) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "🔊 ALARM ACTIVE",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.Yellow
+                    )
+                }
             }
         }
     }
