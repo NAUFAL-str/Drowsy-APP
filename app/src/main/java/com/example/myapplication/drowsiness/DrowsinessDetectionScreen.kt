@@ -46,6 +46,7 @@ fun DrowsinessDetectionScreen(
     // Initialize detection when permission is granted
     LaunchedEffect(cameraPermissionState.status.isGranted) {
         if (cameraPermissionState.status.isGranted) {
+            viewModel.analysisIntervalMs = 500
             viewModel.initializeDetection(context)
         }
     }

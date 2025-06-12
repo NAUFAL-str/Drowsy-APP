@@ -48,6 +48,10 @@ class DrowsinessViewModel : ViewModel() {
     private var cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var faceLandmarker: FaceLandmarker? = null
 
+    // Throttle frame processing to reduce resource usage
+    var analysisIntervalMs: Long = 500
+    private var lastAnalysisTimestamp = 0L
+
     // MediaPipe landmark indices
     companion object {
         private const val TAG = "DrowsinessViewModel" // Consistent TAG
@@ -220,9 +224,55 @@ class DrowsinessViewModel : ViewModel() {
         }, ContextCompat.getMainExecutor(context))
     }
 
+    fun setupBackgroundCamera(context: Context) {
+        Log.i(TAG, "📸 Setting up background camera...")
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+
+        cameraProviderFuture.addListener({
+            try {
+                val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+                val targetResolution = Size(360, 640)
+                val imageAnalyzer = ImageAnalysis.Builder()
+                    .setTargetResolution(targetResolution)
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                    .build()
+                    .also { analyzer ->
+                        analyzer.setAnalyzer(cameraExecutor) { imageProxy ->
+                            Log.v(TAG, "🖼️ BG frame. Rotation: ${imageProxy.imageInfo.rotationDegrees}°")
+                            processImageWithMediaPipe(imageProxy)
+                        }
+                    }
+
+                val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    context as LifecycleOwner,
+                    cameraSelector,
+                    imageAnalyzer
+                )
+                Log.i(TAG, "✅ Background camera bound to lifecycle.")
+            } catch (exc: Exception) {
+                Log.e(TAG, "💥 Background camera setup failed.", exc)
+            }
+
+        }, ContextCompat.getMainExecutor(context))
+    }
+
     private fun processImageWithMediaPipe(imageProxy: ImageProxy) {
         frameCount++
         Log.v(TAG, "Processing frame #$frameCount")
+
+        if (analysisIntervalMs > 0) {
+            val now = System.currentTimeMillis()
+            if (now - lastAnalysisTimestamp < analysisIntervalMs) {
+                Log.v(TAG, "⏩ Frame skipped to respect analysis interval")
+                imageProxy.close()
+                return
+            }
+            lastAnalysisTimestamp = now
+        }
 
         if (_isProcessing.value) {
             Log.w(TAG, "🐢 Processor busy, skipping frame #$frameCount.")
